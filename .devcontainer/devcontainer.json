@@ -1,0 +1,72 @@
+{
+  "name": "Apart Sandbox",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "args": {
+      "TZ": "${localEnv:TZ:America/Los_Angeles}",
+      "CLAUDE_CODE_VERSION": "latest",
+      "GIT_DELTA_VERSION": "0.18.2",
+      "ZSH_IN_DOCKER_VERSION": "1.2.0"
+    }
+  },
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {},
+    "ghcr.io/devcontainers/features/github-cli:1": {}
+  },
+  "runArgs": [
+    "--cap-add=NET_ADMIN",
+    "--cap-add=NET_RAW",
+    "--userns=keep-id",
+    "--name=apart",
+    "--device=nvidia.com/gpu=1"
+  ],
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "anthropic.claude-code",
+        "dbaeumer.vscode-eslint",
+        "esbenp.prettier-vscode",
+        "eamodio.gitlens"
+      ],
+      "settings": {
+        "editor.formatOnSave": true,
+        "editor.defaultFormatter": "esbenp.prettier-vscode",
+        "editor.codeActionsOnSave": {
+          "source.fixAll.eslint": "explicit"
+        },
+        "terminal.integrated.defaultProfile.linux": "zsh",
+        "terminal.integrated.profiles.linux": {
+          "bash": {
+            "path": "bash",
+            "icon": "terminal-bash"
+          },
+          "zsh": {
+            "path": "zsh"
+          }
+        }
+      }
+    }
+  },
+  "remoteUser": "dev",
+  "mounts": [
+    "source=claude-code-bashhistory-${devcontainerId},target=/commandhistory,type=volume",
+    "source=claude-code-config-${devcontainerId},target=/home/dev/.claude,type=volume",
+    "source=${localEnv:SSH_AUTH_SOCK},target=/ssh-agent,type=bind,z=true",
+    "source=${localEnv:HOME}/.claude/CLAUDE.md,target=/home/dev/.claude/CLAUDE.md,type=bind,z=true",
+    "source=${localEnv:XDG_RUNTIME_DIR}/podman/podman.sock,target=/run/podman/podman.sock,type=bind,z=true",
+    "source=${localEnv:HOME}/.zshrc-devcontainer,target=/home/dev/.zshrc,type=bind,z=true"
+  ],
+  "containerEnv": {
+    "NODE_OPTIONS": "--max-old-space-size=4096",
+    "CLAUDE_CONFIG_DIR": "/home/dev/.claude",
+    "POWERLEVEL9K_DISABLE_GITSTATUS": "true",
+    "SSH_AUTH_SOCK": "/ssh-agent",
+    "HF_TOKEN": "${localEnv:HF_TOKEN}",
+    "UV_SYSTEM_PYTHON": "1"
+  },
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=delegated,z=true",
+  "workspaceFolder": "/workspace",
+  "postCreateCommand": "sudo chown -R dev:dev /commandhistory /home/dev/.claude",
+  "postStartCommand": "sudo /usr/local/bin/fix-docker-nft.sh",
+  "waitFor": "postStartCommand"
+}
