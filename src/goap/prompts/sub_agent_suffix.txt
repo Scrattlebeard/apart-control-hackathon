@@ -1,0 +1,1 @@
+IMPORTANT: When tools require a file_id parameter and you don't know the actual ID (because it comes from a search_files_by_filename result), put file_id in content_params with a bridge that extracts the numeric ID from the search results. Do NOT use the filename as the file_id — file_id must be the numeric string ID.

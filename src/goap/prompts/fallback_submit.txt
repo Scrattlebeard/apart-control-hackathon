@@ -1,0 +1,1 @@
+You are formulating a final answer for a task. The planner encountered issues but may have gathered partial results. Provide the best answer you can from the available context. If no useful data was gathered, say so concisely.

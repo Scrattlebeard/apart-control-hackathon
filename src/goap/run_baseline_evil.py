@@ -1,4 +1,9 @@
-"""CLI entry point for running GOAP evaluations on AgentDojo."""
+"""CLI entry point for running baseline evaluations with attack policy on AgentDojo.
+
+The model gets direct tool access with no planner constraints, and in attack
+mode the system prompt is swapped to include side-task instructions. This is
+the worst-case baseline: full tool access + adversarial system prompt.
+"""
 
 import argparse
 import logging
@@ -6,53 +11,19 @@ import logging
 from control_arena import EvalMode
 from control_arena.eval import get_control_task
 from control_arena.eval._control_eval_config import ControlEvalConfig
+from control_arena.policy._untrusted_policy import untrusted_policy_builder
 from control_arena.settings.agentdojo_setting import AgentDojoSetting
 from inspect_ai import eval as inspect_eval
 from inspect_ai.model import GenerateConfig
 
-from goap.protocol import goap_protocol
-
-
-def build_task(
-    mode: EvalMode,
-    suite: str = "workspace",
-    main_task: str | None = None,
-    side_task: str | None = None,
-    attack: str | None = None,
-    untrusted_model: str | None = None,
-    trusted_model: str | None = None,
-):
-    """Build an Inspect task for the GOAP protocol on AgentDojo."""
-    setting = AgentDojoSetting(
-        suite=suite,
-        main_task=main_task,
-        side_task=side_task,
-        attack=attack or ("important_instructions" if mode == EvalMode.ATTACK else None),
-    )
-
-    protocol = goap_protocol()
-
-    eval_config = ControlEvalConfig(
-        untrusted_model=untrusted_model,
-        trusted_model=trusted_model,
-        untrusted_config=GenerateConfig(max_tool_output=40 * 1024),
-    )
-
-    return get_control_task(
-        setting=setting,
-        micro_protocol=protocol,
-        mode=mode,
-        eval_config=eval_config,
-    )
-
 
 def main():
-    parser = argparse.ArgumentParser(description="Run GOAP evaluations on AgentDojo")
+    parser = argparse.ArgumentParser(description="Run baseline evaluations with attack policy on AgentDojo")
     parser.add_argument(
         "--mode",
         choices=["honest", "attack"],
-        default="honest",
-        help="Evaluation mode",
+        default="attack",
+        help="Evaluation mode (defaults to attack)",
     )
     parser.add_argument("--suite", default="workspace", help="AgentDojo suite")
     parser.add_argument(
@@ -64,12 +35,7 @@ def main():
     parser.add_argument(
         "--model",
         default="openrouter/google/gemini-3-flash-preview",
-        help="Untrusted model (content generation within actions)",
-    )
-    parser.add_argument(
-        "--trusted-model",
-        default=None,
-        help="Trusted model (defaults to --model since GOAP planner is deterministic)",
+        help="Model to use",
     )
     parser.add_argument("--log-dir", default="./logs", help="Log directory")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -82,16 +48,23 @@ def main():
     )
 
     mode = EvalMode.ATTACK if args.mode == "attack" else EvalMode.HONEST
-    trusted = args.trusted_model or args.model
 
-    task = build_task(
-        mode=mode,
+    setting = AgentDojoSetting(
         suite=args.suite,
         main_task=args.main_task,
         side_task=args.side_task,
-        attack=args.attack,
-        untrusted_model=args.model,
-        trusted_model=trusted,
+        attack=args.attack or ("important_instructions" if mode == EvalMode.ATTACK else None),
+    )
+
+    task = get_control_task(
+        setting=setting,
+        micro_protocol=untrusted_policy_builder(),
+        mode=mode,
+        eval_config=ControlEvalConfig(
+            untrusted_model=args.model,
+            trusted_model=args.model,
+            untrusted_config=GenerateConfig(max_tool_output=40 * 1024),
+        ),
     )
 
     inspect_eval(

@@ -10,7 +10,7 @@ import heapq
 import logging
 from dataclasses import dataclass, field
 
-from goap.types import GoapAction, GoalState, Plan, WorldState
+from goap.types import GoalState, GoapAction, Plan, WorldState
 
 logger = logging.getLogger(__name__)
 
@@ -39,8 +39,14 @@ def a_star_plan(
 
     Returns None if no plan exists within the iteration budget.
     """
+    logger.info(
+        "A* search started — %d available actions, goal conditions: %s",
+        len(available_actions),
+        dict(goal.conditions),
+    )
+
     if start.satisfies(goal.conditions):
-        logger.info("Goal already satisfied, empty plan")
+        logger.info("Goal already satisfied, returning empty plan")
         return Plan(actions=[], goal=goal)
 
     counter = 0
@@ -70,14 +76,16 @@ def a_star_plan(
             if new_state_key in visited:
                 continue
 
-            new_actions = node.actions + [action]
+            new_actions = [*node.actions, action]
             new_g = node.g_score + action.cost
 
             if new_state.satisfies(goal.conditions):
+                action_seq = " → ".join(a.name for a in new_actions)
                 logger.info(
-                    "Plan found in %d iterations, %d actions",
+                    "Plan found in %d iterations, %d actions: %s",
                     iterations,
                     len(new_actions),
+                    action_seq,
                 )
                 return Plan(actions=new_actions, goal=goal)
 
@@ -100,3 +108,46 @@ def a_star_plan(
         len(visited),
     )
     return None
+
+
+def diagnose_failure(
+    start: WorldState,
+    goal: GoalState,
+    available_actions: list[GoapAction],
+) -> set[str]:
+    """Find preconditions that are unreachable from the start state.
+
+    Computes the forward-reachable state (all conditions that *could*
+    become true by chaining actions from the start), then returns goal
+    and precondition keys that never become reachable. Used by the
+    fallback loop to tell the trusted model what bridges are missing.
+    """
+    # Forward-reachable: keep applying any applicable action until fixed point
+    reachable = dict(start.conditions)
+    changed = True
+    while changed:
+        changed = False
+        for action in available_actions:
+            # Check if this action's preconditions are all reachable
+            if all(reachable.get(k) == v for k, v in action.preconditions.items()):
+                for k, v in action.effects.items():
+                    if reachable.get(k) != v:
+                        reachable[k] = v
+                        changed = True
+
+    # Which goal conditions are unreachable?
+    unreachable_goals = {
+        k for k, v in goal.conditions.items() if reachable.get(k) != v
+    }
+
+    # Which preconditions across all actions are unreachable?
+    unreachable_preconds: set[str] = set()
+    for action in available_actions:
+        for k, v in action.preconditions.items():
+            if reachable.get(k) != v:
+                unreachable_preconds.add(k)
+
+    result = unreachable_goals | unreachable_preconds
+    if result:
+        logger.info("Unreachable conditions: %s", result)
+    return result
