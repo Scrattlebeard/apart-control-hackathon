@@ -13,6 +13,7 @@ Action types:
 
 import json
 import logging
+import re
 from typing import Any
 
 from control_arena._control_agent import ControlAgent, control_agent
@@ -48,6 +49,8 @@ class GoapStore(StoreModel):
     phase: str = "planning"  # planning | executing | replanning | done
     replan_count: int = 0
     catalog: list[dict[str, Any]] | None = None  # serialized ToolTemplate list
+    setting_name: str = "agentdojo"
+    write_tools: list[str] = []  # noqa: RUF012  — inferred from tool names
     # Bridge outputs: condition_name → generated value (string or list)
     # e.g. "append_activities:content" → "Activity 5: ..."
     # e.g. "create_event:participants" → ["a@b.com", "c@d.com"]
@@ -147,30 +150,34 @@ def _parse_bridge_json(raw: str, expected_keys: list[str]) -> dict[str, Any]:
     return {k: raw.strip() for k in expected_keys}
 
 
-# Tools where empty output is expected (write/mutate operations)
-_WRITE_TOOLS = frozenset({
-    "create_calendar_event",
-    "reschedule_calendar_event",
-    "add_calendar_event_participants",
-    "send_email",
-    "append_to_file",
-    "create_file",
-    "delete_file",
-    "submit",
-})
+_WRITE_VERB_PREFIXES = (
+    "send_", "create_", "delete_", "append_", "add_", "update_",
+    "share_", "schedule_", "reschedule_", "transfer_",
+)
 
 
-def _is_empty_result(messages: list, tool_name: str | None = None) -> bool:
+def _infer_write_tools(catalog_data: list[dict[str, Any]] | None) -> list[str]:
+    """Derive write/mutate tool names from the catalog by scanning for verb prefixes."""
+    names: list[str] = ["submit"]
+    if not catalog_data:
+        return names
+    for entry in catalog_data:
+        name = entry.get("name", "")
+        if any(name.startswith(prefix) for prefix in _WRITE_VERB_PREFIXES):
+            names.append(name)
+    return names
+
+
+def _is_empty_result(messages: list, tool_name: str | None = None, write_tools: frozenset[str] | None = None) -> bool:
     """Check if the most recent tool result is effectively empty.
 
     Catches: no results found, empty lists, truncated output with no
     usable data. Intentionally conservative — only triggers on clear
     "nothing here" signals, not on short but valid results.
 
-    Write/mutate tools (create_calendar_event, send_email, etc.) often
-    return empty on success — that's not a failure.
+    Write/mutate tools often return empty on success — that's not a failure.
     """
-    if tool_name and tool_name in _WRITE_TOOLS:
+    if tool_name and write_tools and tool_name in write_tools:
         return False
 
     # Walk backwards to find the last ChatMessageTool
@@ -181,13 +188,8 @@ def _is_empty_result(messages: list, tool_name: str | None = None) -> bool:
         stripped = text.strip()
         if not stripped:
             return True
-        lowered = stripped.lower()
-        # AgentDojo's "no results" patterns
-        if "no emails found" in lowered:
-            return True
-        if "no files found" in lowered:
-            return True
-        if "no events found" in lowered:
+        # Generic "no results" pattern — covers AgentDojo and ShadeArena
+        if re.match(r"^No \w+ found", stripped, re.IGNORECASE):
             return True
         # Empty list representations
         if stripped in ("[]", "[ ]"):
@@ -375,6 +377,7 @@ def _goap_untrusted_policy() -> ControlAgent:
 
 @control_agent
 def goap_protocol(
+    setting_name: str = Field(default="agentdojo"),
     untrusted_policy: ControlAgent = Field(default_factory=_goap_untrusted_policy),
 ) -> Agent:
     """GOAP-based micro-protocol.
@@ -386,6 +389,7 @@ def goap_protocol(
 
     async def impl(state: AgentState, tools: list[Tool]) -> AgentState:
         goap = store_as(GoapStore)
+        goap.setting_name = setting_name
 
         if goap.phase in ("planning", "replanning"):
             return await _do_planning(state, tools, goap, untrusted_policy)
@@ -468,7 +472,7 @@ async def _do_planning(state: AgentState, tools: list[Tool], goap: GoapStore, un
         logger.info("Initial planning for task: %.120s", task_description)
 
     try:
-        plan, catalog = await generate_plan(task_description, tools, context=context)
+        plan, catalog = await generate_plan(task_description, tools, context=context, setting_name=goap.setting_name)
     except PlanningError as e:
         logger.error("Trusted planner failed: %s", e)
         state.messages.append(
@@ -481,6 +485,7 @@ async def _do_planning(state: AgentState, tools: list[Tool], goap: GoapStore, un
     goap.plan_index = 0
     goap.phase = "executing"
     goap.catalog = _serialize_catalog(catalog)
+    goap.write_tools = _infer_write_tools(goap.catalog)
 
     # Merge any world state from the model
     # (generate_plan uses it internally; we track effects during execution)
@@ -508,7 +513,7 @@ async def _do_execution(state: AgentState, tools: list[Tool], goap: GoapStore, u
         # Get the tool name of the action that just ran
         prev_spec = goap.plan[goap.plan_index - 1] if goap.plan and goap.plan_index > 0 else None
         prev_tool = prev_spec.get("tool_name") if prev_spec else None
-        if _is_empty_result(state.messages, tool_name=prev_tool):
+        if _is_empty_result(state.messages, tool_name=prev_tool, write_tools=frozenset(goap.write_tools)):
             # Record what was tried so the re-planner can avoid repeating it
             failed_spec = goap.plan[goap.plan_index - 1] if goap.plan and goap.plan_index > 0 else None
             if failed_spec:
@@ -770,7 +775,7 @@ async def _execute_sub_agent(
     )
 
     try:
-        sub_plan, _ = await generate_plan(task_description, tools, context=context)
+        sub_plan, _ = await generate_plan(task_description, tools, context=context, setting_name=goap.setting_name)
     except PlanningError as e:
         logger.error("Sub-agent planning failed: %s", e)
         state.messages.append(

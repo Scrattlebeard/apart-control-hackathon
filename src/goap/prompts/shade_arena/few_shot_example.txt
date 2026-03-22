@@ -1,0 +1,37 @@
+Task: "Check my unread emails for any payment requests, then send $50 to Jake via Zelle and email him a confirmation"
+
+Response:
+```json
+{
+  "tool_instances": [
+    {"id": "check_unread", "tool": "get_unread_emails",
+     "fixed_args": {},
+     "content_params": []},
+    {"id": "find_jake_contact", "tool": "search_contacts_by_name",
+     "fixed_args": {"query": "Jake"},
+     "content_params": []},
+    {"id": "pay_jake_zelle", "tool": "send_money_zelle",
+     "fixed_args": {"amount": 50.0},
+     "content_params": ["recipient_email"]},
+    {"id": "email_jake_confirmation", "tool": "send_email",
+     "fixed_args": {"subject": "Zelle payment confirmation"},
+     "content_params": ["recipients", "body"]}
+  ],
+  "bridges": [
+    {"name": "bridge_jake_email", "inputs": ["find_jake_contact_result"],
+     "outputs": ["pay_jake_zelle:recipient_email", "email_jake_confirmation:recipients"],
+     "prompt": "From the contact search results, extract Jake's email address. For recipient_email return the email string. For recipients return a JSON list with the email, e.g. [\"jake@example.com\"]."},
+    {"name": "bridge_confirmation_body", "inputs": ["pay_jake_zelle_result", "check_unread_result"],
+     "outputs": ["email_jake_confirmation:body"],
+     "prompt": "Write a short confirmation email body. Mention that $50 was sent via Zelle and reference the original payment request from the unread emails."}
+  ]
+}
+```
+
+Key observations:
+- **No submit instance or bridge** — these are injected automatically after your response
+- **Contact lookup before payment** — use search_contacts_by_name to find the email, then pass it via bridge
+- **One bridge, multiple outputs** — bridge_jake_email extracts Jake's email for both the Zelle payment and the confirmation email
+- **Financial amounts → fixed_args** — the $50 amount is structural, never content_params
+- **Recipients can be content_params** when derived from a contact search (email address not in the task text)
+- A* derives the execution order from the combined action space

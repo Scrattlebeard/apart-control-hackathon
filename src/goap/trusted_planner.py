@@ -71,8 +71,8 @@ class SubAgent(BaseModel):
 class PlannerResponse(BaseModel):
     """The trusted model's complete output for a task."""
 
-    goal: dict[str, bool]
-    world_state: dict[str, bool] = {}
+    goal: dict[str, bool] = {}  # ignored — injected by _inject_submit
+    world_state: dict[str, bool] = {}  # only non-empty during re-planning
     tool_instances: list[ToolInstance]
     bridges: list[Bridge] = []
     sub_agents: list[SubAgent] = []
@@ -177,6 +177,144 @@ def build_action_space(
 # ---------------------------------------------------------------------------
 
 
+def _inject_submit(response: PlannerResponse) -> None:
+    """Inject the canonical submit instance, bridge, and goal.
+
+    The model should NOT include submit — we add it deterministically so
+    there's no chance of a validation failure on a boilerplate element.
+    Mutates *response* in place.
+    """
+    # Strip any submit the model included (belt-and-suspenders)
+    submit_ids = {i.id for i in response.tool_instances if i.tool == "submit"}
+    response.tool_instances = [i for i in response.tool_instances if i.tool != "submit"]
+    # Strip bridges that fed into model-provided submit instances
+    if submit_ids:
+        submit_outputs = {f"{sid}:{p}" for sid in submit_ids for p in ("answer",)}
+        response.bridges = [
+            b for b in response.bridges
+            if not any(out in submit_outputs for out in b.outputs)
+        ]
+
+    # Collect all non-submit tool effects to feed into the submit bridge
+    all_effects = [f"{inst.id}_result" for inst in response.tool_instances]
+    # Also include bridge and sub-agent effects
+    all_effects += [out for b in response.bridges for out in b.outputs]
+    all_effects += [s.effect for s in response.sub_agents]
+
+    # Find the "terminal" effects — those not consumed as inputs by anything else
+    consumed: set[str] = set()
+    for inst in response.tool_instances:
+        for p in inst.content_params:
+            consumed.add(f"{inst.id}:{p}")
+    for b in response.bridges:
+        consumed.update(b.inputs)
+    for s in response.sub_agents:
+        consumed.add(s.state_input)
+
+    terminal = [e for e in all_effects if e not in consumed] or all_effects[-1:]
+
+    submit_id = "goap_submit"
+    response.tool_instances.append(
+        ToolInstance(id=submit_id, tool="submit", content_params=["answer"])
+    )
+    response.bridges.append(
+        Bridge(
+            name="bridge_submit",
+            inputs=terminal,
+            outputs=[f"{submit_id}:answer"],
+            prompt="Summarize the results of all completed steps into a concise final answer.",
+        )
+    )
+    response.goal = {f"{submit_id}_result": True}
+
+
+def _normalize_bridges(response: PlannerResponse) -> None:
+    """Fix common bridge wiring mistakes by matching against known conditions.
+
+    Builds an index of valid conditions from tool instances, then rewrites
+    bridge inputs/outputs that don't match any known condition but are close
+    enough to be unambiguous.
+
+    Mutates *response* in place.
+    """
+    # Build the valid condition index
+    # Effects: {id}_result for each tool instance
+    valid_effects: dict[str, str] = {}  # normalized_key → canonical form
+    for inst in response.tool_instances:
+        canonical = f"{inst.id}_result"
+        valid_effects[canonical] = canonical
+        # Also index without _result suffix for fuzzy matching
+        valid_effects[inst.id] = canonical
+
+    # Preconditions: {id}:{param} for each content_param
+    valid_preconditions: dict[str, str] = {}  # normalized_key → canonical form
+    for inst in response.tool_instances:
+        for param in inst.content_params:
+            canonical = f"{inst.id}:{param}"
+            valid_preconditions[canonical] = canonical
+            # Common wrong separators
+            valid_preconditions[f"{inst.id}.{param}"] = canonical
+            valid_preconditions[f"{inst.id}_{param}"] = canonical
+            valid_preconditions[f"{inst.id}/{param}"] = canonical
+
+    # Also index bridge effects and sub-agent effects as valid inputs
+    bridge_effects: dict[str, str] = {}
+    for bridge in response.bridges:
+        for out in bridge.outputs:
+            bridge_effects[out] = out
+    for sub in response.sub_agents:
+        bridge_effects[sub.effect] = sub.effect
+
+    all_valid_inputs = {**valid_effects, **bridge_effects}
+    all_valid_outputs = valid_preconditions
+
+    changed = False
+    for bridge in response.bridges:
+        # Normalize inputs (should reference {id}_result or bridge/sub-agent effects)
+        new_inputs = []
+        for inp in bridge.inputs:
+            if inp in all_valid_inputs:
+                new_inputs.append(all_valid_inputs[inp])
+            elif inp in all_valid_outputs:
+                # Model put a precondition as an input — probably meant the _result
+                logger.warning("Bridge '%s': input '%s' looks like a precondition, not an effect", bridge.name, inp)
+                new_inputs.append(inp)
+            else:
+                # Try appending _result
+                with_result = f"{inp}_result"
+                if with_result in all_valid_inputs:
+                    logger.warning("Bridge '%s': input '%s' → '%s'", bridge.name, inp, with_result)
+                    new_inputs.append(with_result)
+                    changed = True
+                else:
+                    new_inputs.append(inp)
+
+        # Normalize outputs (should reference {id}:{param})
+        new_outputs = []
+        for out in bridge.outputs:
+            if out in all_valid_outputs:
+                new_outputs.append(all_valid_outputs[out])
+            elif out in all_valid_inputs:
+                # Model put an effect as an output — wrong direction
+                logger.warning("Bridge '%s': output '%s' is an effect, not a precondition — keeping as-is", bridge.name, out)
+                new_outputs.append(out)
+            else:
+                # Check if it matches a precondition with wrong separator
+                canonical = all_valid_outputs.get(out)
+                if canonical:
+                    logger.warning("Bridge '%s': output '%s' → '%s'", bridge.name, out, canonical)
+                    new_outputs.append(canonical)
+                    changed = True
+                else:
+                    new_outputs.append(out)
+
+        bridge.inputs = new_inputs
+        bridge.outputs = new_outputs
+
+    if changed:
+        logger.info("Bridge wiring normalized")
+
+
 def _validate_response(
     response: PlannerResponse,
     catalog: list[ToolTemplate],
@@ -221,35 +359,32 @@ def _validate_response(
                     f"(type: {param.type}), got {type(value).__name__}: {value!r}"
                 )
 
-        # No overlap
+        # Auto-resolve overlap: fixed_args wins
         overlap = set(inst.fixed_args.keys()) & set(inst.content_params)
         if overlap:
-            raise PlanningError(
-                f"Instance '{inst.id}': params in both fixed_args and content_params: {overlap}"
+            logger.warning(
+                "Instance '%s': params in both fixed_args and content_params: %s — removing from content_params",
+                inst.id, overlap,
             )
+            inst.content_params = [p for p in inst.content_params if p not in overlap]
 
-    # Unique instance IDs
-    ids = [inst.id for inst in response.tool_instances]
-    ids += [b.name for b in response.bridges]
-    ids += [s.name for s in response.sub_agents]
-    if len(set(ids)) != len(ids):
-        dupes = [x for x in ids if ids.count(x) > 1]
-        raise PlanningError(f"Duplicate action IDs: {set(dupes)}")
+    # Auto-deduplicate IDs by suffixing
+    seen: dict[str, int] = {}
+    for item in [*response.tool_instances, *response.bridges, *response.sub_agents]:
+        key = item.id if isinstance(item, ToolInstance) else item.name
+        if key in seen:
+            seen[key] += 1
+            new_key = f"{key}_{seen[key]}"
+            if isinstance(item, ToolInstance):
+                logger.warning("Duplicate instance ID '%s' → renamed to '%s'", key, new_key)
+                item.id = new_key
+            else:
+                logger.warning("Duplicate action ID '%s' → renamed to '%s'", key, new_key)
+                item.name = new_key
+        else:
+            seen[key] = 0
 
-    # Must have exactly one submit instance
-    submit_instances = [i for i in response.tool_instances if i.tool == "submit"]
-    if len(submit_instances) != 1:
-        raise PlanningError(
-            f"Must have exactly one submit tool instance, found {len(submit_instances)}"
-        )
-
-    # Goal must include the submit instance's effect
-    submit_id = submit_instances[0].id
-    submit_effect = f"{submit_id}_result"
-    if submit_effect not in response.goal:
-        raise PlanningError(
-            f"Goal must include '{submit_effect}: true' (the submit instance's effect)"
-        )
+    # Submit is injected by _inject_submit — any model-provided ones were already stripped
 
 
 # ---------------------------------------------------------------------------
@@ -257,11 +392,12 @@ def _validate_response(
 # ---------------------------------------------------------------------------
 
 
-def _build_system_prompt() -> str:
+def _build_system_prompt(setting_name: str = "agentdojo") -> str:
     """Load and assemble the trusted planner system prompt."""
     template = load_prompt("trusted_planner.txt")
-    example = load_prompt("few_shot_example.txt")
-    return template.replace("__EXAMPLE__", example)
+    example = load_prompt("few_shot_example.txt", setting=setting_name)
+    addendum = load_prompt("planner_addendum.txt", setting=setting_name)
+    return template.replace("__EXAMPLE__", example).replace("__ADDENDUM__", addendum)
 
 
 # ---------------------------------------------------------------------------
@@ -274,9 +410,10 @@ async def _call_trusted_model(
     catalog: list[ToolTemplate],
     context: str = "",
     error_context: str = "",
+    setting_name: str = "agentdojo",
 ) -> PlannerResponse:
     """Single trusted model call. Returns parsed PlannerResponse."""
-    system_content = _build_system_prompt()
+    system_content = _build_system_prompt(setting_name)
 
     user_content = f"## Task\n\n{task_description}\n\n"
     if context:
@@ -329,6 +466,7 @@ async def generate_plan(
     task_description: str,
     tools: list[Tool],
     context: str = "",
+    setting_name: str = "agentdojo",
 ) -> tuple[Plan, list[ToolTemplate]]:
     """Use the trusted model to generate a GOAP plan for the given task.
 
@@ -339,9 +477,13 @@ async def generate_plan(
     Raises PlanningError on failure.
     """
     catalog = build_catalog(tools)
+    # Don't show submit to the planner — it's injected automatically
+    planner_catalog = [t for t in catalog if t.name != "submit"]
 
-    response = await _call_trusted_model(task_description, catalog, context)
-    _validate_response(response, catalog)
+    response = await _call_trusted_model(task_description, planner_catalog, context, setting_name=setting_name)
+    _inject_submit(response)
+    _normalize_bridges(response)
+    _validate_response(response, catalog)  # validate against full catalog (includes submit)
 
     actions = build_action_space(response, catalog)
 
@@ -370,8 +512,10 @@ async def generate_plan(
         logger.warning("A* failed, retrying with error context: %s", error_msg)
 
         response2 = await _call_trusted_model(
-            task_description, catalog, context, error_context=error_msg
+            task_description, planner_catalog, context, error_context=error_msg, setting_name=setting_name
         )
+        _inject_submit(response2)
+        _normalize_bridges(response2)
         _validate_response(response2, catalog)
         actions2 = build_action_space(response2, catalog)
 
