@@ -34,7 +34,7 @@ from pydantic import Field
 from control_arena import control_task_metadata
 from goap.planner import a_star_plan
 from goap.prompts import load_prompt
-from goap.trusted_planner import PlanningError, generate_plan
+from goap.trusted_planner import PlanResult, PlanningError, generate_plan
 from goap.types import GoalState, GoapAction, Plan, ToolTemplate, WorldState
 
 logger = logging.getLogger(__name__)
@@ -450,6 +450,46 @@ async def _do_submit_fallback(state: AgentState, tools: list[Tool], goap: GoapSt
     return state
 
 
+def _log_planner_exchanges(state: AgentState, result: PlanResult) -> None:
+    """Append planner model exchanges to state.messages for transcript visibility."""
+    for user_prompt, raw_response in result.exchanges:
+        state.messages.append(ChatMessageUser(content=f"[GOAP planner]\n{user_prompt}"))
+        state.messages.append(ChatMessageAssistant(content=f"[GOAP planner]\n{raw_response}"))
+
+
+async def _run_planner(
+    state: AgentState, tools: list[Tool], goap: GoapStore,
+    task_description: str, context: str = "",
+) -> AgentState:
+    """Run the trusted planner: generate plan, log exchanges, store results."""
+    result = await generate_plan(
+        task_description, tools,
+        context=context, setting_name=goap.setting_name,
+    )
+
+    _log_planner_exchanges(state, result)
+
+    goap.plan = _serialize_plan(result.plan)
+    goap.plan_index = 0
+    goap.phase = "executing"
+    goap.catalog = _serialize_catalog(result.catalog)
+    goap.write_tools = _infer_write_tools(goap.catalog)
+
+    plan_summary = "\n".join(
+        f"  {i + 1}. {a['name']} [{a['action_type']}]"
+        for i, a in enumerate(goap.plan)
+    )
+    logger.info("GOAP plan:\n%s", plan_summary)
+
+    state.messages.append(
+        ChatMessageAssistant(
+            content=f"GOAP plan ({len(goap.plan)} steps):\n{plan_summary}\n\nExecuting step 1..."
+        )
+    )
+
+    return state
+
+
 async def _do_planning(state: AgentState, tools: list[Tool], goap: GoapStore, untrusted_policy: ControlAgent) -> AgentState:
     """Use the trusted planner to generate and solve a plan."""
     meta = control_task_metadata()
@@ -472,7 +512,7 @@ async def _do_planning(state: AgentState, tools: list[Tool], goap: GoapStore, un
         logger.info("Initial planning for task: %.120s", task_description)
 
     try:
-        plan, catalog = await generate_plan(task_description, tools, context=context, setting_name=goap.setting_name)
+        state = await _run_planner(state, tools, goap, task_description, context)
     except PlanningError as e:
         logger.error("Trusted planner failed: %s", e)
         state.messages.append(
@@ -480,27 +520,6 @@ async def _do_planning(state: AgentState, tools: list[Tool], goap: GoapStore, un
         )
         goap.phase = "done"
         return state
-
-    goap.plan = _serialize_plan(plan)
-    goap.plan_index = 0
-    goap.phase = "executing"
-    goap.catalog = _serialize_catalog(catalog)
-    goap.write_tools = _infer_write_tools(goap.catalog)
-
-    # Merge any world state from the model
-    # (generate_plan uses it internally; we track effects during execution)
-
-    plan_summary = "\n".join(
-        f"  {i + 1}. {a['name']} [{a['action_type']}]"
-        for i, a in enumerate(goap.plan)
-    )
-    logger.info("GOAP plan:\n%s", plan_summary)
-
-    state.messages.append(
-        ChatMessageAssistant(
-            content=f"GOAP plan generated ({len(goap.plan)} steps):\n{plan_summary}\n\nExecuting step 1..."
-        )
-    )
 
     return await _do_execution(state, tools, goap, untrusted_policy)
 
@@ -775,7 +794,7 @@ async def _execute_sub_agent(
     )
 
     try:
-        sub_plan, _ = await generate_plan(task_description, tools, context=context, setting_name=goap.setting_name)
+        result = await generate_plan(task_description, tools, context=context, setting_name=goap.setting_name)
     except PlanningError as e:
         logger.error("Sub-agent planning failed: %s", e)
         state.messages.append(
@@ -784,12 +803,14 @@ async def _execute_sub_agent(
         goap.plan_index += 1
         return state
 
+    _log_planner_exchanges(state, result)
+
     # Strip submit action from sub-plan — parent plan handles submission
-    sub_plan_actions = [a for a in sub_plan.actions if a.tool_name != "submit"]
+    sub_plan_actions = [a for a in result.plan.actions if a.tool_name != "submit"]
     # Also strip bridges that only feed into the submit
-    submit_names = {a.name for a in sub_plan.actions if a.tool_name == "submit"}
+    submit_names = {a.name for a in result.plan.actions if a.tool_name == "submit"}
     submit_effects = set()
-    for a in sub_plan.actions:
+    for a in result.plan.actions:
         if a.tool_name == "submit":
             submit_effects.update(a.preconditions.keys())
     # Keep bridges whose output feeds non-submit actions

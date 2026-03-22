@@ -12,6 +12,8 @@ are derived mechanically from tool signatures and bridge declarations.
 
 import json
 import logging
+import re
+from dataclasses import dataclass, field
 from typing import Any
 
 from inspect_ai.model import (
@@ -33,6 +35,15 @@ logger = logging.getLogger(__name__)
 
 class PlanningError(Exception):
     """Raised when the trusted planner fails to produce a valid plan."""
+
+
+@dataclass
+class PlanResult:
+    """Result of plan generation, including raw model exchanges for logging."""
+
+    plan: Plan
+    catalog: list[ToolTemplate]
+    exchanges: list[tuple[str, str]] = field(default_factory=list)  # (user_prompt, raw_response)
 
 
 # ---------------------------------------------------------------------------
@@ -401,6 +412,60 @@ def _build_system_prompt(setting_name: str = "agentdojo") -> str:
 
 
 # ---------------------------------------------------------------------------
+# JSON extraction
+# ---------------------------------------------------------------------------
+
+# Trailing commas before } or ]
+_TRAILING_COMMA = re.compile(r",\s*([}\]])")
+
+
+def _repair_json(text: str) -> str:
+    """Fix common JSON syntax issues from LLM output."""
+    text = _TRAILING_COMMA.sub(r"\1", text)
+    return text
+
+
+def _extract_json(text: str) -> dict:
+    """Extract the first valid JSON object from *text*.
+
+    Handles markdown fences, preamble/postamble chatter, and minor
+    syntax issues (trailing commas). Raises ValueError if no valid
+    JSON object is found.
+    """
+    # Strip markdown fences
+    text = re.sub(r"```(?:json)?\s*\n?", "", text)
+
+    # Fast path: the whole thing is valid JSON
+    repaired = _repair_json(text.strip())
+    try:
+        return json.loads(repaired)
+    except json.JSONDecodeError:
+        pass
+
+    # Scan for the first { and try progressively larger substrings
+    start = text.find("{")
+    if start == -1:
+        raise ValueError("No JSON object found in response")
+
+    # Find matching } by trying json.loads on substrings ending at each }
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                candidate = _repair_json(text[start : i + 1])
+                try:
+                    return json.loads(candidate)
+                except json.JSONDecodeError:
+                    # Keep scanning — this } wasn't the right one
+                    depth = 1
+
+    raise ValueError(f"No valid JSON object found (scanned from position {start})")
+
+
+# ---------------------------------------------------------------------------
 # Trusted model call
 # ---------------------------------------------------------------------------
 
@@ -411,8 +476,11 @@ async def _call_trusted_model(
     context: str = "",
     error_context: str = "",
     setting_name: str = "agentdojo",
-) -> PlannerResponse:
-    """Single trusted model call. Returns parsed PlannerResponse."""
+) -> tuple[PlannerResponse, str, str]:
+    """Single trusted model call.
+
+    Returns (parsed_response, user_content, raw_response_text).
+    """
     system_content = _build_system_prompt(setting_name)
 
     user_content = f"## Task\n\n{task_description}\n\n"
@@ -435,16 +503,10 @@ async def _call_trusted_model(
 
     raw = result.choices[0].message.text.strip()
 
-    # Strip markdown fences if present
-    if raw.startswith("```"):
-        lines = raw.split("\n")
-        lines = [l for l in lines if not l.strip().startswith("```")]
-        raw = "\n".join(lines)
-
     try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as e:
-        raise PlanningError(f"Trusted model returned invalid JSON: {e}\nRaw: {raw[:500]}") from e
+        data = _extract_json(raw)
+    except ValueError as e:
+        raise PlanningError(f"Trusted model returned no valid JSON: {e}\nRaw: {raw[:500]}") from e
 
     try:
         response = PlannerResponse.model_validate(data)
@@ -454,7 +516,7 @@ async def _call_trusted_model(
     if not response.tool_instances:
         raise PlanningError("Trusted model returned no tool instances")
 
-    return response
+    return response, user_content, raw
 
 
 # ---------------------------------------------------------------------------
@@ -467,20 +529,24 @@ async def generate_plan(
     tools: list[Tool],
     context: str = "",
     setting_name: str = "agentdojo",
-) -> tuple[Plan, list[ToolTemplate]]:
+) -> PlanResult:
     """Use the trusted model to generate a GOAP plan for the given task.
 
-    Returns (plan, catalog). The plan's actions have action_type set
-    to "tool", "bridge", or "run_agent". The catalog is needed by the
-    protocol for sub-agent planning.
+    Returns a PlanResult containing the plan, catalog, and raw model
+    exchanges (for transcript logging).
 
     Raises PlanningError on failure.
     """
     catalog = build_catalog(tools)
     # Don't show submit to the planner — it's injected automatically
     planner_catalog = [t for t in catalog if t.name != "submit"]
+    exchanges: list[tuple[str, str]] = []
 
-    response = await _call_trusted_model(task_description, planner_catalog, context, setting_name=setting_name)
+    response, user_content, raw_response = await _call_trusted_model(
+        task_description, planner_catalog, context, setting_name=setting_name
+    )
+    exchanges.append((user_content, raw_response))
+
     _inject_submit(response)
     _normalize_bridges(response)
     _validate_response(response, catalog)  # validate against full catalog (includes submit)
@@ -511,9 +577,11 @@ async def generate_plan(
         )
         logger.warning("A* failed, retrying with error context: %s", error_msg)
 
-        response2 = await _call_trusted_model(
+        response2, user_content2, raw_response2 = await _call_trusted_model(
             task_description, planner_catalog, context, error_context=error_msg, setting_name=setting_name
         )
+        exchanges.append((user_content2, raw_response2))
+
         _inject_submit(response2)
         _normalize_bridges(response2)
         _validate_response(response2, catalog)
@@ -536,4 +604,4 @@ async def generate_plan(
         len(plan.actions),
         " → ".join(a.name for a in plan.actions),
     )
-    return plan, catalog
+    return PlanResult(plan=plan, catalog=catalog, exchanges=exchanges)
