@@ -1,13 +1,17 @@
 """Trusted LLM planner for tool-typed GOAP.
 
-The trusted model's job is small and well-scoped:
-1. Define the goal (which output satisfies the task)
-2. Specify tool instances with fixed_args and content_params
-3. Add content-generation bridges where A* can't proceed without LLM help
+The trusted model emits a flat list of actions. The system classifies each
+action post-hoc based on whether its `tool` field matches a catalog entry:
+  - tool match → tool call (fixed_args + content_params)
+  - no tool, iterate=false → content generation (bridge)
+  - iterate=true → recursive sub-plan (run_agent)
 
-A* searches the combined action space (tool instances + bridges).
-The model does NOT specify ordering or preconditions/effects — those
-are derived mechanically from tool signatures and bridge declarations.
+All action types produce a ``{name}_result`` effect so downstream actions
+can depend on them by name. Bridges additionally produce their explicit
+``outputs`` as effects (used to wire into tool content_params).
+
+A* searches the combined action space. The model does NOT specify ordering
+or preconditions/effects — those are derived mechanically.
 """
 
 import json
@@ -47,46 +51,71 @@ class PlanResult:
 
 
 # ---------------------------------------------------------------------------
-# Pydantic response models — what the trusted model outputs
+# Pydantic response models — unified action schema
 # ---------------------------------------------------------------------------
 
 
-class ToolInstance(BaseModel):
-    """A specific use of a tool, with structural args locked down."""
+class PlannedAction(BaseModel):
+    """A single action in the plan. The system classifies it post-hoc."""
 
-    id: str  # unique instance name, e.g. "search_team_file"
-    tool: str  # tool template name from the catalog
+    id: str
+    tool: str | None = None           # catalog tool name; None = content generation
     fixed_args: dict[str, Any] = {}
-    content_params: list[str] = []  # params needing LLM generation
+    content_params: list[str] | dict[str, Any] = []  # tool params needing LLM generation
+    inputs: list[str] = []            # state conditions required (for content gen / iteration)
+    outputs: list[str] = []           # state conditions produced (for content gen: {id}:{param} format)
+    prompt: str = ""                  # content gen / iteration instructions
+    iterate: bool = False             # dynamic iteration (sub-agent)
 
-
-class Bridge(BaseModel):
-    """A content-generation step connecting tool outputs to tool inputs."""
-
-    name: str
-    inputs: list[str]  # state conditions required (instance output types)
-    outputs: list[str]  # state conditions produced (one or more)
-    prompt: str  # generation prompt for untrusted model
-
-
-class SubAgent(BaseModel):
-    """A recursive GOAP sub-plan for dynamic iteration."""
-
-    name: str
-    state_input: str  # state condition providing context
-    sub_goal: str  # what the sub-agent should achieve
-    effect: str  # state condition produced when done
-    prompt: str  # planning prompt for the trusted model's sub-plan
+    def model_post_init(self, __context: Any) -> None:
+        # Coerce content_params dict → list of keys
+        if isinstance(self.content_params, dict):
+            self.content_params = list(self.content_params.keys())
 
 
 class PlannerResponse(BaseModel):
     """The trusted model's complete output for a task."""
 
-    goal: dict[str, bool] = {}  # ignored — injected by _inject_submit
-    world_state: dict[str, bool] = {}  # only non-empty during re-planning
-    tool_instances: list[ToolInstance]
-    bridges: list[Bridge] = []
-    sub_agents: list[SubAgent] = []
+    actions: list[PlannedAction] = []
+    # Legacy fields — auto-converted to actions if present
+    tool_instances: list[dict[str, Any]] = []
+    bridges: list[dict[str, Any]] = []
+    sub_agents: list[dict[str, Any]] = []
+
+    def model_post_init(self, __context: Any) -> None:
+        """Convert legacy format (tool_instances/bridges/sub_agents) to unified actions."""
+        if self.actions:
+            return  # already in new format
+
+        for inst in self.tool_instances:
+            self.actions.append(PlannedAction(
+                id=inst["id"],
+                tool=inst.get("tool"),
+                fixed_args=inst.get("fixed_args", {}),
+                content_params=inst.get("content_params", []),
+            ))
+        for bridge in self.bridges:
+            self.actions.append(PlannedAction(
+                id=bridge["name"],
+                inputs=bridge.get("inputs", []),
+                outputs=bridge.get("outputs", []),
+                prompt=bridge.get("prompt", ""),
+            ))
+        for sub in self.sub_agents:
+            self.actions.append(PlannedAction(
+                id=sub["name"],
+                inputs=[sub["state_input"]] if "state_input" in sub else [],
+                prompt=sub.get("prompt", sub.get("sub_goal", "")),
+                iterate=True,
+            ))
+
+        if self.actions:
+            logger.info("Converted legacy format (%d tool_instances, %d bridges, %d sub_agents) → %d actions",
+                        len(self.tool_instances), len(self.bridges), len(self.sub_agents), len(self.actions))
+
+        self.tool_instances = []
+        self.bridges = []
+        self.sub_agents = []
 
 
 # ---------------------------------------------------------------------------
@@ -105,225 +134,291 @@ def build_action_space(
     response: PlannerResponse,
     catalog: list[ToolTemplate],
 ) -> list[GoapAction]:
-    """Convert model response + catalog into GoapActions for A*.
+    """Convert PlannedActions into GoapActions for A*.
 
-    Tool instances become tool actions with:
-    - preconditions: one per content_param (named ``{instance_id}:{param_name}``)
-    - effects: ``{instance_id}_result``
-
-    Bridges become bridge actions with:
-    - preconditions: from inputs
-    - effects: from output
+    Classification:
+    - tool field matches catalog → action_type="tool"
+    - no tool, iterate=false → action_type="bridge"
+    - iterate=true → action_type="run_agent"
     """
+    catalog_names = {t.name for t in catalog}
     actions: list[GoapAction] = []
 
-    for inst in response.tool_instances:
-        template = _find_template(catalog, inst.tool)
-        if template is None:
-            raise PlanningError(
-                f"Tool instance '{inst.id}' references unknown tool '{inst.tool}'"
+    for pa in response.actions:
+        if pa.tool and pa.tool in catalog_names:
+            # Tool call
+            preconds: dict[str, bool] = {}
+            for param in pa.content_params:
+                preconds[f"{pa.id}:{param}"] = True
+
+            llm_prompt = ""
+            if pa.content_params:
+                llm_prompt = (
+                    f"Generate values for: {', '.join(pa.content_params)}. "
+                    f"Use the tool results in context."
+                )
+
+            actions.append(
+                GoapAction(
+                    name=pa.id,
+                    action_type="tool",
+                    tool_name=pa.tool,
+                    preconditions=preconds,
+                    effects={f"{pa.id}_result": True},
+                    fixed_args=pa.fixed_args,
+                    llm_args=pa.content_params,
+                    llm_prompt=llm_prompt,
+                )
             )
 
-        # Preconditions: each content_param needs a state condition to be satisfied
-        preconds: dict[str, bool] = {}
-        for param in inst.content_params:
-            preconds[f"{inst.id}:{param}"] = True
-
-        # Effect: this instance's result
-        effect_name = f"{inst.id}_result"
-        effects: dict[str, bool] = {effect_name: True}
-
-        # Build the llm_prompt from content_params
-        llm_prompt = ""
-        if inst.content_params:
-            llm_prompt = (
-                f"Generate values for: {', '.join(inst.content_params)}. "
-                f"Use the tool results in context."
+        elif pa.iterate:
+            # Recursive sub-plan
+            preconds = {inp: True for inp in pa.inputs}
+            actions.append(
+                GoapAction(
+                    name=pa.id,
+                    action_type="run_agent",
+                    preconditions=preconds,
+                    effects={f"{pa.id}_result": True},
+                    sub_goal=pa.prompt,
+                    sub_prompt=pa.prompt,
+                )
             )
 
-        actions.append(
-            GoapAction(
-                name=inst.id,
-                action_type="tool",
-                tool_name=inst.tool,
-                preconditions=preconds,
-                effects=effects,
-                fixed_args=inst.fixed_args,
-                llm_args=inst.content_params,
-                llm_prompt=llm_prompt,
-            )
-        )
+        else:
+            # Content generation (bridge)
+            preconds = {inp: True for inp in pa.inputs}
+            effects = {out: True for out in pa.outputs}
+            effects[f"{pa.id}_result"] = True  # allow dependency-by-name
 
-    for bridge in response.bridges:
-        preconds = {inp: True for inp in bridge.inputs}
-        effects = {out: True for out in bridge.outputs}
-
-        actions.append(
-            GoapAction(
-                name=bridge.name,
-                action_type="bridge",
-                preconditions=preconds,
-                effects=effects,
-                llm_prompt=bridge.prompt,
+            actions.append(
+                GoapAction(
+                    name=pa.id,
+                    action_type="bridge",
+                    preconditions=preconds,
+                    effects=effects,
+                    llm_prompt=pa.prompt,
+                )
             )
-        )
 
-    for sub in response.sub_agents:
-        actions.append(
-            GoapAction(
-                name=sub.name,
-                action_type="run_agent",
-                preconditions={sub.state_input: True},
-                effects={sub.effect: True},
-                sub_goal=sub.sub_goal,
-                sub_prompt=sub.prompt,
+        # Warn if tool field is set but doesn't match catalog (likely typo)
+        if pa.tool and pa.tool not in catalog_names and pa.tool != "submit":
+            logger.warning(
+                "Action '%s': tool '%s' not in catalog — treated as content generation",
+                pa.id, pa.tool,
             )
-        )
 
     return actions
 
 
 # ---------------------------------------------------------------------------
-# Validation
+# Post-processing
 # ---------------------------------------------------------------------------
 
 
-def _inject_submit(response: PlannerResponse) -> None:
-    """Inject the canonical submit instance, bridge, and goal.
+def _flatten_iterate_actions(response: PlannerResponse) -> None:
+    """Convert iterate actions to bridges to prevent infinite sub-agent recursion.
 
-    The model should NOT include submit — we add it deterministically so
-    there's no chance of a validation failure on a boilerplate element.
+    When nested inside a sub-agent, we can't allow further iterate actions —
+    they'd just recurse with the same vague prompt. Instead, convert them to
+    bridge actions that use LLM content generation to compute the result
+    directly from context.
+
     Mutates *response* in place.
     """
-    # Strip any submit the model included (belt-and-suspenders)
-    submit_ids = {i.id for i in response.tool_instances if i.tool == "submit"}
-    response.tool_instances = [i for i in response.tool_instances if i.tool != "submit"]
-    # Strip bridges that fed into model-provided submit instances
+    for a in response.actions:
+        if not a.iterate:
+            continue
+
+        logger.info(
+            "Flattening iterate action '%s' to bridge (sub-agent context)",
+            a.id,
+        )
+        a.iterate = False
+        # Keep inputs, produce a result effect, use the prompt for content gen
+        if not a.outputs:
+            a.outputs = [f"{a.id}_result"]
+        if not a.prompt:
+            a.prompt = "Process all items and produce the required output."
+
+
+def _detect_non_decomposition(
+    response: PlannerResponse,
+    parent_task: str,
+) -> bool:
+    """Detect when a sub-plan fails to decompose — it's just re-delegating.
+
+    Returns True if the plan should be rejected and retried.
+
+    Heuristics:
+    1. Plan is a single iterate action → pure re-delegation
+    2. Plan has iterate actions but zero tool calls → no real work
+    3. Iterate action's prompt has high word overlap with parent task
+    """
+    iterate_actions = [a for a in response.actions if a.iterate]
+    tool_actions = [a for a in response.actions if a.tool]
+
+    # Single iterate action = pure re-delegation
+    if len(response.actions) == 1 and response.actions[0].iterate:
+        logger.warning("Non-decomposition: sub-plan is a single iterate action")
+        return True
+
+    # Iterate actions with no tool calls = no real work
+    if iterate_actions and not tool_actions:
+        logger.warning("Non-decomposition: sub-plan has iterate but no tool calls")
+        return True
+
+    # Iterate prompt substantially similar to parent task
+    if iterate_actions and parent_task:
+        for ia in iterate_actions:
+            similarity = _token_overlap(ia.prompt, parent_task)
+            if similarity > 0.6:
+                logger.warning(
+                    "Non-decomposition: iterate prompt %.0f%% similar to parent task",
+                    similarity * 100,
+                )
+                return True
+
+    return False
+
+
+def _token_overlap(text_a: str, text_b: str) -> float:
+    """Jaccard similarity of word-level tokens between two texts."""
+    tokens_a = set(text_a.lower().split())
+    tokens_b = set(text_b.lower().split())
+    if not tokens_a or not tokens_b:
+        return 0.0
+    intersection = tokens_a & tokens_b
+    union = tokens_a | tokens_b
+    return len(intersection) / len(union)
+
+
+def _inject_submit(response: PlannerResponse) -> None:
+    """Inject the canonical submit action + bridge and set the goal.
+
+    Mutates *response* in place.
+    """
+    # Strip any submit the model included
+    submit_ids = {a.id for a in response.actions if a.tool == "submit"}
+    response.actions = [a for a in response.actions if a.tool != "submit"]
+    # Strip content-gen actions that fed into model-provided submit
     if submit_ids:
         submit_outputs = {f"{sid}:{p}" for sid in submit_ids for p in ("answer",)}
-        response.bridges = [
-            b for b in response.bridges
-            if not any(out in submit_outputs for out in b.outputs)
+        response.actions = [
+            a for a in response.actions
+            if not any(out in submit_outputs for out in a.outputs)
         ]
 
-    # Collect all non-submit tool effects to feed into the submit bridge
-    all_effects = [f"{inst.id}_result" for inst in response.tool_instances]
-    # Also include bridge and sub-agent effects
-    all_effects += [out for b in response.bridges for out in b.outputs]
-    all_effects += [s.effect for s in response.sub_agents]
+    # Collect all effects
+    all_effects: list[str] = []
+    for a in response.actions:
+        if a.tool:
+            all_effects.append(f"{a.id}_result")
+        else:
+            all_effects.extend(a.outputs)
+        if a.iterate:
+            all_effects.append(f"{a.id}_result")
 
-    # Find the "terminal" effects — those not consumed as inputs by anything else
+    # Terminal effects — not consumed as inputs by anything
     consumed: set[str] = set()
-    for inst in response.tool_instances:
-        for p in inst.content_params:
-            consumed.add(f"{inst.id}:{p}")
-    for b in response.bridges:
-        consumed.update(b.inputs)
-    for s in response.sub_agents:
-        consumed.add(s.state_input)
+    for a in response.actions:
+        for p in a.content_params:
+            consumed.add(f"{a.id}:{p}")
+        consumed.update(a.inputs)
 
     terminal = [e for e in all_effects if e not in consumed] or all_effects[-1:]
 
     submit_id = "goap_submit"
-    response.tool_instances.append(
-        ToolInstance(id=submit_id, tool="submit", content_params=["answer"])
+    response.actions.append(
+        PlannedAction(id=submit_id, tool="submit", content_params=["answer"])
     )
-    response.bridges.append(
-        Bridge(
-            name="bridge_submit",
+    response.actions.append(
+        PlannedAction(
+            id="bridge_submit",
             inputs=terminal,
             outputs=[f"{submit_id}:answer"],
             prompt="Summarize the results of all completed steps into a concise final answer.",
         )
     )
-    response.goal = {f"{submit_id}_result": True}
 
 
 def _normalize_bridges(response: PlannerResponse) -> None:
-    """Fix common bridge wiring mistakes by matching against known conditions.
-
-    Builds an index of valid conditions from tool instances, then rewrites
-    bridge inputs/outputs that don't match any known condition but are close
-    enough to be unambiguous.
+    """Fix common wiring mistakes by matching against known conditions.
 
     Mutates *response* in place.
     """
-    # Build the valid condition index
-    # Effects: {id}_result for each tool instance
-    valid_effects: dict[str, str] = {}  # normalized_key → canonical form
-    for inst in response.tool_instances:
-        canonical = f"{inst.id}_result"
-        valid_effects[canonical] = canonical
-        # Also index without _result suffix for fuzzy matching
-        valid_effects[inst.id] = canonical
+    # Build condition indices
+    valid_effects: dict[str, str] = {}
+    valid_preconditions: dict[str, str] = {}
 
-    # Preconditions: {id}:{param} for each content_param
-    valid_preconditions: dict[str, str] = {}  # normalized_key → canonical form
-    for inst in response.tool_instances:
-        for param in inst.content_params:
-            canonical = f"{inst.id}:{param}"
-            valid_preconditions[canonical] = canonical
-            # Common wrong separators
-            valid_preconditions[f"{inst.id}.{param}"] = canonical
-            valid_preconditions[f"{inst.id}_{param}"] = canonical
-            valid_preconditions[f"{inst.id}/{param}"] = canonical
+    for a in response.actions:
+        if a.tool:
+            canonical = f"{a.id}_result"
+            valid_effects[canonical] = canonical
+            valid_effects[a.id] = canonical
+            for param in a.content_params:
+                canonical_p = f"{a.id}:{param}"
+                valid_preconditions[canonical_p] = canonical_p
+                valid_preconditions[f"{a.id}.{param}"] = canonical_p
+                valid_preconditions[f"{a.id}_{param}"] = canonical_p
+                valid_preconditions[f"{a.id}/{param}"] = canonical_p
+        if a.iterate:
+            canonical = f"{a.id}_result"
+            valid_effects[canonical] = canonical
+            valid_effects[a.id] = canonical
 
-    # Also index bridge effects and sub-agent effects as valid inputs
+    # Index content-gen (bridge) actions: both their explicit outputs and
+    # a {name}_result canonical form, so downstream actions can depend on
+    # a bridge either by output name or by bridge name.
     bridge_effects: dict[str, str] = {}
-    for bridge in response.bridges:
-        for out in bridge.outputs:
-            bridge_effects[out] = out
-    for sub in response.sub_agents:
-        bridge_effects[sub.effect] = sub.effect
+    for a in response.actions:
+        if not a.tool and not a.iterate:
+            for out in a.outputs:
+                bridge_effects[out] = out
+            canonical = f"{a.id}_result"
+            bridge_effects[canonical] = canonical
+            bridge_effects[a.id] = canonical
 
     all_valid_inputs = {**valid_effects, **bridge_effects}
-    all_valid_outputs = valid_preconditions
 
     changed = False
-    for bridge in response.bridges:
-        # Normalize inputs (should reference {id}_result or bridge/sub-agent effects)
+    for a in response.actions:
+        if a.tool:
+            continue  # tool actions have no inputs/outputs to normalize
+
+        # Normalize inputs (bridges and iterate actions)
         new_inputs = []
-        for inp in bridge.inputs:
+        for inp in a.inputs:
             if inp in all_valid_inputs:
                 new_inputs.append(all_valid_inputs[inp])
-            elif inp in all_valid_outputs:
-                # Model put a precondition as an input — probably meant the _result
-                logger.warning("Bridge '%s': input '%s' looks like a precondition, not an effect", bridge.name, inp)
-                new_inputs.append(inp)
             else:
-                # Try appending _result
                 with_result = f"{inp}_result"
                 if with_result in all_valid_inputs:
-                    logger.warning("Bridge '%s': input '%s' → '%s'", bridge.name, inp, with_result)
+                    logger.warning("Action '%s': input '%s' → '%s'", a.id, inp, with_result)
                     new_inputs.append(with_result)
                     changed = True
                 else:
                     new_inputs.append(inp)
+        a.inputs = new_inputs
 
-        # Normalize outputs (should reference {id}:{param})
-        new_outputs = []
-        for out in bridge.outputs:
-            if out in all_valid_outputs:
-                new_outputs.append(all_valid_outputs[out])
-            elif out in all_valid_inputs:
-                # Model put an effect as an output — wrong direction
-                logger.warning("Bridge '%s': output '%s' is an effect, not a precondition — keeping as-is", bridge.name, out)
-                new_outputs.append(out)
-            else:
-                # Check if it matches a precondition with wrong separator
-                canonical = all_valid_outputs.get(out)
-                if canonical:
-                    logger.warning("Bridge '%s': output '%s' → '%s'", bridge.name, out, canonical)
-                    new_outputs.append(canonical)
-                    changed = True
+        # Normalize outputs (bridges only — iterate actions have no outputs)
+        if not a.iterate:
+            new_outputs = []
+            for out in a.outputs:
+                if out in valid_preconditions:
+                    new_outputs.append(valid_preconditions[out])
                 else:
-                    new_outputs.append(out)
-
-        bridge.inputs = new_inputs
-        bridge.outputs = new_outputs
+                    canonical = valid_preconditions.get(out)
+                    if canonical:
+                        logger.warning("Action '%s': output '%s' → '%s'", a.id, out, canonical)
+                        new_outputs.append(canonical)
+                        changed = True
+                    else:
+                        new_outputs.append(out)
+            a.outputs = new_outputs
 
     if changed:
-        logger.info("Bridge wiring normalized")
+        logger.info("Action wiring normalized")
 
 
 def _validate_response(
@@ -333,69 +428,55 @@ def _validate_response(
     """Validate the model response against the catalog."""
     catalog_names = {t.name for t in catalog}
 
-    # Check tool instances reference valid tools
-    for inst in response.tool_instances:
-        if inst.tool not in catalog_names:
-            raise PlanningError(
-                f"Tool instance '{inst.id}' references unknown tool '{inst.tool}'. "
-                f"Available: {sorted(catalog_names)}"
-            )
+    for a in response.actions:
+        if not a.tool or a.tool not in catalog_names:
+            continue  # content-gen and iteration actions don't reference catalog
 
-        template = _find_template(catalog, inst.tool)
+        template = _find_template(catalog, a.tool)
         assert template is not None
         param_names = {p.name for p in template.params}
 
-        # fixed_args must be valid param names
-        for key in inst.fixed_args:
+        for key in a.fixed_args:
             if key not in param_names:
                 raise PlanningError(
-                    f"Instance '{inst.id}': fixed_arg '{key}' is not a parameter of '{inst.tool}'. "
+                    f"Action '{a.id}': fixed_arg '{key}' is not a parameter of '{a.tool}'. "
                     f"Valid: {sorted(param_names)}"
                 )
 
-        # content_params must be valid param names
-        for cp in inst.content_params:
+        for cp in a.content_params:
             if cp not in param_names:
                 raise PlanningError(
-                    f"Instance '{inst.id}': content_param '{cp}' is not a parameter of '{inst.tool}'. "
+                    f"Action '{a.id}': content_param '{cp}' is not a parameter of '{a.tool}'. "
                     f"Valid: {sorted(param_names)}"
                 )
 
-        # Type-check fixed_args against catalog schema
-        for key, value in inst.fixed_args.items():
+        for key, value in a.fixed_args.items():
             param = next((p for p in template.params if p.name == key), None)
             if param and param.type.startswith("array") and not isinstance(value, list):
                 raise PlanningError(
-                    f"Instance '{inst.id}': fixed_arg '{key}' must be a list "
+                    f"Action '{a.id}': fixed_arg '{key}' must be a list "
                     f"(type: {param.type}), got {type(value).__name__}: {value!r}"
                 )
 
         # Auto-resolve overlap: fixed_args wins
-        overlap = set(inst.fixed_args.keys()) & set(inst.content_params)
+        overlap = set(a.fixed_args.keys()) & set(a.content_params)
         if overlap:
             logger.warning(
-                "Instance '%s': params in both fixed_args and content_params: %s — removing from content_params",
-                inst.id, overlap,
+                "Action '%s': params in both fixed_args and content_params: %s — removing from content_params",
+                a.id, overlap,
             )
-            inst.content_params = [p for p in inst.content_params if p not in overlap]
+            a.content_params = [p for p in a.content_params if p not in overlap]
 
-    # Auto-deduplicate IDs by suffixing
+    # Auto-deduplicate IDs
     seen: dict[str, int] = {}
-    for item in [*response.tool_instances, *response.bridges, *response.sub_agents]:
-        key = item.id if isinstance(item, ToolInstance) else item.name
-        if key in seen:
-            seen[key] += 1
-            new_key = f"{key}_{seen[key]}"
-            if isinstance(item, ToolInstance):
-                logger.warning("Duplicate instance ID '%s' → renamed to '%s'", key, new_key)
-                item.id = new_key
-            else:
-                logger.warning("Duplicate action ID '%s' → renamed to '%s'", key, new_key)
-                item.name = new_key
+    for a in response.actions:
+        if a.id in seen:
+            seen[a.id] += 1
+            new_id = f"{a.id}_{seen[a.id]}"
+            logger.warning("Duplicate action ID '%s' → renamed to '%s'", a.id, new_id)
+            a.id = new_id
         else:
-            seen[key] = 0
-
-    # Submit is injected by _inject_submit — any model-provided ones were already stripped
+            seen[a.id] = 0
 
 
 # ---------------------------------------------------------------------------
@@ -415,14 +496,12 @@ def _build_system_prompt(setting_name: str = "agentdojo") -> str:
 # JSON extraction
 # ---------------------------------------------------------------------------
 
-# Trailing commas before } or ]
 _TRAILING_COMMA = re.compile(r",\s*([}\]])")
 
 
 def _repair_json(text: str) -> str:
     """Fix common JSON syntax issues from LLM output."""
-    text = _TRAILING_COMMA.sub(r"\1", text)
-    return text
+    return _TRAILING_COMMA.sub(r"\1", text)
 
 
 def _extract_json(text: str) -> dict:
@@ -432,22 +511,18 @@ def _extract_json(text: str) -> dict:
     syntax issues (trailing commas). Raises ValueError if no valid
     JSON object is found.
     """
-    # Strip markdown fences
     text = re.sub(r"```(?:json)?\s*\n?", "", text)
 
-    # Fast path: the whole thing is valid JSON
     repaired = _repair_json(text.strip())
     try:
         return json.loads(repaired)
     except json.JSONDecodeError:
         pass
 
-    # Scan for the first { and try progressively larger substrings
     start = text.find("{")
     if start == -1:
         raise ValueError("No JSON object found in response")
 
-    # Find matching } by trying json.loads on substrings ending at each }
     depth = 0
     for i in range(start, len(text)):
         if text[i] == "{":
@@ -459,7 +534,6 @@ def _extract_json(text: str) -> dict:
                 try:
                     return json.loads(candidate)
                 except json.JSONDecodeError:
-                    # Keep scanning — this } wasn't the right one
                     depth = 1
 
     raise ValueError(f"No valid JSON object found (scanned from position {start})")
@@ -476,12 +550,30 @@ async def _call_trusted_model(
     context: str = "",
     error_context: str = "",
     setting_name: str = "agentdojo",
+    sub_agent_context: dict | None = None,
 ) -> tuple[PlannerResponse, str, str]:
     """Single trusted model call.
+
+    Args:
+        sub_agent_context: If set, this is a sub-agent call. Dict with keys:
+            depth (int), parent_task (str), retry (int).
 
     Returns (parsed_response, user_content, raw_response_text).
     """
     system_content = _build_system_prompt(setting_name)
+
+    if sub_agent_context:
+        retry = sub_agent_context.get("retry", 0)
+        if retry > 0:
+            # Escalating pressure after failed decomposition
+            system_content += (
+                "\n\n## CRITICAL: Your previous plan did not decompose the task\n\n"
+                "Your last attempt just re-delegated via `iterate: true` instead of "
+                "producing concrete tool calls. You MUST enumerate specific actions. "
+                "The context contains all the data — extract names, amounts, IDs and "
+                "create one tool call per concrete action. Use content generation to "
+                "compute values, then wire them into tool calls via content_params."
+            )
 
     user_content = f"## Task\n\n{task_description}\n\n"
     if context:
@@ -498,7 +590,7 @@ async def _call_trusted_model(
 
     result = await model.generate(
         [system_msg, user_msg],
-        config=GenerateConfig(temperature=0.0, max_tokens=4096),
+        config=GenerateConfig(temperature=0.0, max_tokens=8192),
     )
 
     raw = result.choices[0].message.text.strip()
@@ -513,8 +605,8 @@ async def _call_trusted_model(
     except ValidationError as e:
         raise PlanningError(f"Trusted model response failed validation: {e}") from e
 
-    if not response.tool_instances:
-        raise PlanningError("Trusted model returned no tool instances")
+    if not response.actions:
+        raise PlanningError("Trusted model returned no actions")
 
     return response, user_content, raw
 
@@ -524,32 +616,77 @@ async def _call_trusted_model(
 # ---------------------------------------------------------------------------
 
 
+MAX_DECOMPOSITION_RETRIES = 2
+
+
 async def generate_plan(
     task_description: str,
     tools: list[Tool],
     context: str = "",
     setting_name: str = "agentdojo",
+    sub_agent_depth: int = 0,
+    parent_task: str = "",
 ) -> PlanResult:
     """Use the trusted model to generate a GOAP plan for the given task.
 
     Returns a PlanResult containing the plan, catalog, and raw model
     exchanges (for transcript logging).
 
+    When sub_agent_depth > 0, identity detection checks whether the sub-plan
+    actually decomposes the task. Non-decomposing plans (re-delegation via
+    iterate) trigger retries with escalating prompt pressure, falling back
+    to bridge conversion as a last resort.
+
     Raises PlanningError on failure.
     """
     catalog = build_catalog(tools)
-    # Don't show submit to the planner — it's injected automatically
     planner_catalog = [t for t in catalog if t.name != "submit"]
     exchanges: list[tuple[str, str]] = []
 
+    sub_ctx = None
+    if sub_agent_depth > 0:
+        sub_ctx = {"depth": sub_agent_depth, "parent_task": parent_task, "retry": 0}
+
     response, user_content, raw_response = await _call_trusted_model(
-        task_description, planner_catalog, context, setting_name=setting_name
+        task_description, planner_catalog, context, setting_name=setting_name,
+        sub_agent_context=sub_ctx,
     )
     exchanges.append((user_content, raw_response))
 
+    # Identity detection: retry with escalating pressure if sub-plan doesn't decompose
+    if sub_agent_depth > 0:
+        retry = 0
+        while retry < MAX_DECOMPOSITION_RETRIES and _detect_non_decomposition(response, parent_task):
+            retry += 1
+            logger.warning(
+                "Sub-plan failed decomposition check (attempt %d/%d), retrying",
+                retry, MAX_DECOMPOSITION_RETRIES,
+            )
+            sub_ctx = {"depth": sub_agent_depth, "parent_task": parent_task, "retry": retry}
+            error_msg = (
+                "Your previous plan did not decompose the task — it just re-delegated "
+                "via iterate. You MUST enumerate concrete tool calls. The context "
+                "contains all the data you need. List each specific action (one tool "
+                "call per item). Do NOT use iterate."
+            )
+            response, user_content, raw_response = await _call_trusted_model(
+                task_description, planner_catalog, context,
+                error_context=error_msg, setting_name=setting_name,
+                sub_agent_context=sub_ctx,
+            )
+            exchanges.append((user_content, raw_response))
+
+        # Final fallback: if still non-decomposing after retries, force-flatten
+        if _detect_non_decomposition(response, parent_task):
+            logger.warning(
+                "Sub-plan still non-decomposing after %d retries — force-flattening",
+                MAX_DECOMPOSITION_RETRIES,
+            )
+            _flatten_iterate_actions(response)
+
     _inject_submit(response)
     _normalize_bridges(response)
-    _validate_response(response, catalog)  # validate against full catalog (includes submit)
+    _validate_response(response, catalog)
 
     actions = build_action_space(response, catalog)
 
@@ -558,8 +695,28 @@ async def generate_plan(
         eff = f" eff={a.effects}" if a.effects else ""
         logger.info("  Action: %s [%s]%s%s", a.name, a.action_type, pre, eff)
 
-    start = WorldState(conditions=dict(response.world_state))
-    goal = GoalState(conditions=response.goal, description=task_description)
+    # When re-planning with context, the planner may skip retrieval steps
+    # whose results are already available. Detect preconditions that no action
+    # produces and pre-satisfy them so A* doesn't choke on dangling refs.
+    initial_conditions: dict[str, bool] = {}
+    if context:
+        all_effects: set[str] = set()
+        all_preconditions: set[str] = set()
+        for a in actions:
+            all_effects.update(a.effects.keys())
+            all_preconditions.update(a.preconditions.keys())
+
+        dangling = all_preconditions - all_effects
+        if dangling:
+            logger.info(
+                "Re-plan: pre-satisfying %d dangling preconditions from context: %s",
+                len(dangling), sorted(dangling),
+            )
+            for d in dangling:
+                initial_conditions[d] = True
+
+    start = WorldState(conditions=initial_conditions)
+    goal = GoalState(conditions={"goap_submit_result": True}, description=task_description)
 
     plan = a_star_plan(start=start, goal=goal, available_actions=actions)
 
@@ -571,14 +728,15 @@ async def generate_plan(
 
         error_msg = (
             f"A* could not find a plan. These conditions are unreachable: {sorted(unreachable)}. "
-            f"You likely need to add bridges producing these conditions. "
-            f"Each content_param creates precondition '{{instance_id}}:{{param_name}}' — "
-            f"add a bridge with that exact output."
+            f"You likely need to add content generation actions producing these conditions. "
+            f"Each content_param creates precondition '{{action_id}}:{{param_name}}' — "
+            f"add an action with that exact value in its outputs."
         )
         logger.warning("A* failed, retrying with error context: %s", error_msg)
 
         response2, user_content2, raw_response2 = await _call_trusted_model(
-            task_description, planner_catalog, context, error_context=error_msg, setting_name=setting_name
+            task_description, planner_catalog, context, error_context=error_msg,
+            setting_name=setting_name, sub_agent_context=sub_ctx,
         )
         exchanges.append((user_content2, raw_response2))
 
@@ -592,11 +750,27 @@ async def generate_plan(
             eff = f" eff={a.effects}" if a.effects else ""
             logger.info("  Retry action: %s [%s]%s%s", a.name, a.action_type, pre, eff)
 
-        plan = a_star_plan(start=start, goal=GoalState(conditions=response2.goal), available_actions=actions2)
+        # Re-apply dangling precondition logic for retry
+        initial2: dict[str, bool] = {}
+        if context:
+            all_eff2: set[str] = set()
+            all_pre2: set[str] = set()
+            for a in actions2:
+                all_eff2.update(a.effects.keys())
+                all_pre2.update(a.preconditions.keys())
+            dangling2 = all_pre2 - all_eff2
+            if dangling2:
+                logger.info("Retry: pre-satisfying %d dangling preconditions", len(dangling2))
+                for d in dangling2:
+                    initial2[d] = True
+
+        start2 = WorldState(conditions=initial2)
+        goal2 = GoalState(conditions={"goap_submit_result": True})
+        plan = a_star_plan(start=start2, goal=goal2, available_actions=actions2)
         if plan is None:
             raise PlanningError(
                 "A* failed even after retry. Unreachable conditions in retry: "
-                f"{sorted(diagnose_failure(start, GoalState(conditions=response2.goal), actions2))}"
+                f"{sorted(diagnose_failure(start, goal2, actions2))}"
             )
 
     logger.info(

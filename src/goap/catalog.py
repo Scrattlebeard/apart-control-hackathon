@@ -92,6 +92,7 @@ def format_catalog(catalog: list[ToolTemplate]) -> str:
     Example output:
         search_emails(query: string, sender: string) -> search_emails_result
           Search for emails matching query and sender.
+          - query: string — The search query to match against subject/body.
     """
     lines: list[str] = []
     for tmpl in catalog:
@@ -107,4 +108,10 @@ def format_catalog(catalog: list[ToolTemplate]) -> str:
             # First line of description only
             desc_line = tmpl.description.strip().split("\n")[0]
             lines.append(f"  {desc_line}")
+        # Surface param descriptions — critical for the planner to understand
+        # constraints like "must be email addresses" vs "can be any string"
+        for p in tmpl.params:
+            if p.description:
+                desc_first_line = p.description.strip().split("\n")[0]
+                lines.append(f"  - {p.name}: {desc_first_line}")
     return "\n".join(lines)

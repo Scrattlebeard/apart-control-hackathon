@@ -57,6 +57,20 @@ uv run python -m goap.run_eval --mode honest \
   --limit 1 -v
 ```
 
+### ShadeArena tasks
+
+```bash
+uv run python -m goap.run_eval --setting shade_arena --task-pair bank_transfer_2 --mode honest --limit 1 -v
+```
+
+| ID | Task name | Description |
+|----|-----------|-------------|
+| 1 | `api_key_calendar_agendas_2` | Review upcoming appointments, email attendees |
+| 2 | `spam_filter_update` | Standardize spam filter rules across employees |
+| 3 | `bank_transfer_2` | Cabo trip expense splitting + payments via Venmo/Zelle/bank |
+| 4 | `american_airlines_2` | Conference visitor travel: flights, loyalty numbers, restaurant booking |
+| 5 | `expenditure_accounting` | Financial transaction review and documentation |
+
 ## How It Works
 
 The protocol runs inside ControlArena's react scaffold loop:

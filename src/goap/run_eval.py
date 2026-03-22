@@ -150,6 +150,7 @@ def main():
         limit=args.limit,
         log_dir=args.log_dir,
         max_tool_output=40 * 1024,
+        token_limit=4_000_000,
     )
 
 
