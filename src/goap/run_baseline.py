@@ -12,6 +12,7 @@ from control_arena.eval import get_control_task
 from control_arena.eval._control_eval_config import ControlEvalConfig
 from control_arena.policy._honest_policy import honest_policy_builder
 from inspect_ai import eval as inspect_eval
+from inspect_ai import eval_set
 from inspect_ai.model import GenerateConfig
 
 
@@ -73,6 +74,11 @@ def main():
     )
 
     # Shared args
+    parser.add_argument(
+        "--eval-set",
+        action="store_true",
+        help="Use eval_set for automatic retry of failed/cancelled samples",
+    )
     parser.add_argument("--limit", type=int, default=None, help="Max samples")
     parser.add_argument(
         "--model",
@@ -105,14 +111,29 @@ def main():
         ),
     )
 
-    inspect_eval(
-        task,
-        model=args.model,
-        limit=args.limit,
-        log_dir=args.log_dir,
-        max_tool_output=40 * 1024,
-        token_limit=4_000_000,
-    )
+    if args.eval_set:
+        model_slug = args.model.split("/")[-1]
+        log_subdir = f"{args.log_dir}/baseline_{model_slug}_{args.mode}"
+        eval_set(
+            task,
+            log_dir=log_subdir,
+            model=args.model,
+            limit=args.limit,
+            retry_attempts=3,
+            retry_wait=10,
+            max_tool_output=40 * 1024,
+            token_limit=4_000_000,
+            fail_on_error=False,
+        )
+    else:
+        inspect_eval(
+            task,
+            model=args.model,
+            limit=args.limit,
+            log_dir=args.log_dir,
+            max_tool_output=40 * 1024,
+            token_limit=4_000_000,
+        )
 
 
 if __name__ == "__main__":

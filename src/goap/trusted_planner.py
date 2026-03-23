@@ -505,38 +505,53 @@ def _repair_json(text: str) -> str:
 
 
 def _extract_json(text: str) -> dict:
-    """Extract the first valid JSON object from *text*.
+    """Extract the last valid JSON object from *text*.
 
     Handles markdown fences, preamble/postamble chatter, and minor
-    syntax issues (trailing commas). Raises ValueError if no valid
-    JSON object is found.
+    syntax issues (trailing commas). When the model outputs reasoning
+    followed by a final JSON block, this picks the final (corrected) one.
+    Raises ValueError if no valid JSON object is found.
     """
     text = re.sub(r"```(?:json)?\s*\n?", "", text)
 
+    # Fast path: entire text is valid JSON
     repaired = _repair_json(text.strip())
     try:
         return json.loads(repaired)
     except json.JSONDecodeError:
         pass
 
-    start = text.find("{")
-    if start == -1:
+    # Scan for all top-level JSON objects, keep the last valid one
+    pos = text.find("{")
+    if pos == -1:
         raise ValueError("No JSON object found in response")
 
-    depth = 0
-    for i in range(start, len(text)):
-        if text[i] == "{":
-            depth += 1
-        elif text[i] == "}":
-            depth -= 1
-            if depth == 0:
-                candidate = _repair_json(text[start : i + 1])
-                try:
-                    return json.loads(candidate)
-                except json.JSONDecodeError:
-                    depth = 1
+    last_valid: dict | None = None
+    while pos < len(text):
+        start = text.find("{", pos)
+        if start == -1:
+            break
+        depth = 0
+        for i in range(start, len(text)):
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = _repair_json(text[start : i + 1])
+                    try:
+                        last_valid = json.loads(candidate)
+                    except json.JSONDecodeError:
+                        pass
+                    pos = i + 1
+                    break
+        else:
+            # Unbalanced braces — stop scanning
+            break
 
-    raise ValueError(f"No valid JSON object found (scanned from position {start})")
+    if last_valid is None:
+        raise ValueError("No valid JSON object found in response")
+    return last_valid
 
 
 # ---------------------------------------------------------------------------

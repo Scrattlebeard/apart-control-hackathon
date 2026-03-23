@@ -635,6 +635,32 @@ def goap_protocol(
 
 
 MAX_REPLAN_ATTEMPTS = 3
+MAX_DEFERRED_RETRIES = 3  # drop a deferred failure after this many appearances in failed_attempts
+
+
+def _filter_exhausted_deferrals(
+    deferred: list[dict[str, Any]],
+    failed_attempts: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Partition deferred failures into retryable vs exhausted.
+
+    A deferral is exhausted when the same (tool, args) pair already appears
+    >= MAX_DEFERRED_RETRIES times in failed_attempts — meaning we've already
+    replanned for it that many times without success.
+    """
+    retryable, exhausted = [], []
+    for d in deferred:
+        key_tool = d.get("tool", "")
+        key_args = str(d.get("args", {}))
+        prior_count = sum(
+            1 for fa in failed_attempts
+            if fa.get("tool", "") == key_tool and fa.get("args", "") == key_args
+        )
+        if prior_count >= MAX_DEFERRED_RETRIES:
+            exhausted.append(d)
+        else:
+            retryable.append(d)
+    return retryable, exhausted
 
 
 async def _do_submit_fallback(state: AgentState, tools: list[Tool], goap: GoapStore) -> AgentState:
@@ -932,17 +958,36 @@ async def _do_execution(state: AgentState, tools: list[Tool], goap: GoapStore, u
     if goap.plan is None or goap.plan_index >= len(goap.plan):
         # Before finishing, check if there are deferred failures to retry
         if goap.deferred_failures:
+            # Drop deferrals that have already been retried too many times
+            retryable, exhausted = _filter_exhausted_deferrals(
+                goap.deferred_failures, goap.failed_attempts,
+            )
+            for d in exhausted:
+                logger.warning(
+                    "Deferred action '%s' (%s) exhausted %d retries — dropping",
+                    d.get("action", ""), d.get("tool", ""), MAX_DEFERRED_RETRIES,
+                )
+            if not retryable:
+                # All deferrals exhausted — proceed to done
+                logger.warning(
+                    "All %d deferred failures exhausted — proceeding to submit",
+                    len(exhausted),
+                )
+                goap.deferred_failures = []
+                goap.phase = "done"
+                return state
+
             deferred_summary = "\n".join(
                 f"- {d['action']}: {d['tool']}({d['args']}) — {d['result'][:100]}"
-                for d in goap.deferred_failures
+                for d in retryable
             )
             logger.info(
                 "Plan complete with %d deferred failures — replanning for them",
-                len(goap.deferred_failures),
+                len(retryable),
             )
             state.messages.append(
                 ChatMessageAssistant(
-                    content=f"Plan complete. Replanning for {len(goap.deferred_failures)} deferred steps:\n{deferred_summary}"
+                    content=f"Plan complete. Replanning for {len(retryable)} deferred steps:\n{deferred_summary}"
                 )
             )
             # Snapshot triggers so the replanner sees all of them, then move to
@@ -950,9 +995,9 @@ async def _do_execution(state: AgentState, tools: list[Tool], goap: GoapStore, u
             goap.replan_triggers = [
                 {"action": d.get("action", ""), "tool": d.get("tool", ""),
                  "args": str(d.get("args", {})), "result": d.get("result", "")}
-                for d in goap.deferred_failures
+                for d in retryable
             ]
-            for d in goap.deferred_failures:
+            for d in retryable:
                 goap.failed_attempts.append({
                     "action": d.get("action", ""),
                     "tool": d.get("tool", ""),
@@ -976,34 +1021,47 @@ async def _do_execution(state: AgentState, tools: list[Tool], goap: GoapStore, u
         or action_spec.get("name", "").startswith("bridge_submit")
     )
     if is_submit_phase and goap.deferred_failures:
-        deferred_summary = "\n".join(
-            f"- {d['action']}: {d['tool']}({d['args']}) — {d['result'][:100]}"
-            for d in goap.deferred_failures
+        # Drop deferrals that have already been retried too many times
+        retryable, exhausted = _filter_exhausted_deferrals(
+            goap.deferred_failures, goap.failed_attempts,
         )
-        logger.info(
-            "About to submit with %d deferred failures — replanning",
-            len(goap.deferred_failures),
-        )
-        state.messages.append(
-            ChatMessageAssistant(
-                content=f"Replanning for {len(goap.deferred_failures)} deferred steps before submit:\n{deferred_summary}"
+        for d in exhausted:
+            logger.warning(
+                "Deferred action '%s' (%s) exhausted %d retries before submit — dropping",
+                d.get("action", ""), d.get("tool", ""), MAX_DEFERRED_RETRIES,
             )
-        )
-        goap.replan_triggers = [
-            {"action": d.get("action", ""), "tool": d.get("tool", ""),
-             "args": str(d.get("args", {})), "result": d.get("result", "")}
-            for d in goap.deferred_failures
-        ]
-        for d in goap.deferred_failures:
-            goap.failed_attempts.append({
-                "action": d.get("action", ""),
-                "tool": d.get("tool", ""),
-                "args": str(d.get("args", {})),
-                "result": d.get("result", ""),
-            })
         goap.deferred_failures = []
-        goap.phase = "replanning"
-        return state
+        if not retryable:
+            # All exhausted — just proceed with submit
+            pass
+        else:
+            deferred_summary = "\n".join(
+                f"- {d['action']}: {d['tool']}({d['args']}) — {d['result'][:100]}"
+                for d in retryable
+            )
+            logger.info(
+                "About to submit with %d deferred failures — replanning",
+                len(retryable),
+            )
+            state.messages.append(
+                ChatMessageAssistant(
+                    content=f"Replanning for {len(retryable)} deferred steps before submit:\n{deferred_summary}"
+                )
+            )
+            goap.replan_triggers = [
+                {"action": d.get("action", ""), "tool": d.get("tool", ""),
+                 "args": str(d.get("args", {})), "result": d.get("result", "")}
+                for d in retryable
+            ]
+            for d in retryable:
+                goap.failed_attempts.append({
+                    "action": d.get("action", ""),
+                    "tool": d.get("tool", ""),
+                    "args": str(d.get("args", {})),
+                    "result": d.get("result", ""),
+                })
+            goap.phase = "replanning"
+            return state
 
     # Re-plan check: if about to submit but no bridges or content were generated,
     # the plan was retrieval-only → re-plan with context
